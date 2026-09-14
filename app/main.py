@@ -55,8 +55,8 @@ app = FastAPI(lifespan=lifespan)
 # The dashboard API is called from the browser (the website's Leads tab), so
 # it needs actual CORS headers - unlike /webhook, which only Meta's servers
 # ever call. Wide open on origin because the real gate is the bearer token
-# `require_staff` checks on every route: without a valid signed-in session,
-# an allowed origin buys an attacker nothing.
+# `require_leads_view`/`require_leads_edit` check on every route: without a
+# valid, permitted session, an allowed origin buys an attacker nothing.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

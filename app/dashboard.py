@@ -3,10 +3,13 @@
 Staff read Instagram conversations and reply to them from the site instead of
 the Instagram app itself. Every route here requires the same signed-in
 session the rest of the site already runs on (Supabase Auth, or the Firebase
-bridge for accounts still on their old password) - checked by handing the
-caller's own bearer token to PostgREST and trusting its verdict, the exact
-check the website's own Supabase client relies on for every query it makes.
-No separate login or API key for staff to manage.
+bridge for accounts still on their old password), checked against the exact
+same permission the site's own Admin Panel grants per role - `messenger`
+section + `leads` tab (see kazi-app migration 0033) - by asking PostgREST's
+`my_permissions`/`my_messenger_tabs` views with the caller's own token. This
+is the actual enforcement boundary, not the frontend: the site hides the
+Leads tab for someone without access, but that is a convenience, not the
+guarantee - this is, since it is where a message actually gets sent.
 
 Sending a reply goes through the same Graph API call the bot itself uses
 (`meta.send_text`), then mutes the thread - a human answering from here is a
@@ -57,25 +60,61 @@ MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 SEND_URL_TTL_SECONDS = 300
 
 
-async def require_staff(authorization: Optional[str] = Header(None)) -> None:
-    """Trust whatever session the caller's browser is already using for the
-    rest of the site. PostgREST verifies the token's signature and expiry for
-    us on this one lightweight read - a 401 from Supabase means "not signed
-    in", anything else means the token was good."""
+async def _leads_permission(authorization: Optional[str]) -> dict:
+    """{"view": bool, "edit": bool} for whoever the caller's own bearer token
+    identifies - both the section-level `messenger` permission and the
+    `leads` tab permission have to agree, same as the site's own
+    messengerTabAllowed()/messengerTabCanEdit() in src/utils/permissions.js.
+    A 401 from either call (bad/expired token) doubles as the session check -
+    PostgREST verifies the JWT's signature and expiry before RLS even runs."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Sign in to use the lead inbox.")
     token = authorization[len("Bearer ") :]
+    caller_headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {token}"}
     try:
-        response = await _http.get(
-            f"{SUPABASE_URL}/rest/v1/ig_bot_threads",
-            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {token}"},
-            params={"select": "convo", "limit": "1"},
+        section_res, tab_res = await asyncio.gather(
+            _http.get(
+                f"{SUPABASE_URL}/rest/v1/my_permissions",
+                headers=caller_headers,
+                params={"section_id": "eq.messenger", "select": "can_view,can_edit"},
+            ),
+            _http.get(
+                f"{SUPABASE_URL}/rest/v1/my_messenger_tabs",
+                headers=caller_headers,
+                params={"tab_id": "eq.leads", "select": "can_view,can_edit"},
+            ),
         )
     except httpx.HTTPError as exc:
-        log.warning("session check failed: %s", exc)
+        log.warning("permission check failed: %s", exc)
         raise HTTPException(503, "Could not verify your session - try again.")
-    if response.status_code == 401:
+
+    if section_res.status_code == 401 or tab_res.status_code == 401:
         raise HTTPException(401, "Your session has expired - sign in again.")
+    if section_res.status_code >= 400 or tab_res.status_code >= 400:
+        log.error(
+            "permission check error (%s/%s): %s / %s",
+            section_res.status_code, tab_res.status_code, section_res.text, tab_res.text,
+        )
+        raise HTTPException(503, "Could not verify your permissions - try again.")
+
+    section_rows = section_res.json()
+    tab_rows = tab_res.json()
+    section = section_rows[0] if section_rows else {}
+    tab = tab_rows[0] if tab_rows else {}
+    return {
+        "view": bool(section.get("can_view")) and bool(tab.get("can_view")),
+        "edit": bool(section.get("can_edit")) and bool(tab.get("can_edit")),
+    }
+
+
+async def require_leads_view(authorization: Optional[str] = Header(None)) -> None:
+    if not (await _leads_permission(authorization))["view"]:
+        raise HTTPException(403, "Your role doesn't include the lead inbox.")
+
+
+async def require_leads_edit(authorization: Optional[str] = Header(None)) -> None:
+    if not (await _leads_permission(authorization))["edit"]:
+        raise HTTPException(403, "Your role can view the lead inbox but not act on it.")
 
 
 def _split_convo(convo: str) -> tuple[str, str, str]:
@@ -114,7 +153,7 @@ class TakeoverBody(BaseModel):
     muted: bool
 
 
-@router.get("/leads", dependencies=[Depends(require_staff)])
+@router.get("/leads", dependencies=[Depends(require_leads_view)])
 async def list_leads():
     response = await _http.get(
         f"{SUPABASE_URL}/rest/v1/ig_bot_messages",
@@ -220,7 +259,7 @@ def _attach_reply_previews(rows: list[dict]) -> list[dict]:
     return out
 
 
-@router.get("/leads/{convo}/messages", dependencies=[Depends(require_staff)])
+@router.get("/leads/{convo}/messages", dependencies=[Depends(require_leads_view)])
 async def lead_messages(convo: str):
     _split_convo(convo)
     response = await _http.get(
@@ -247,7 +286,7 @@ async def lead_messages(convo: str):
     return await asyncio.gather(*(with_media_url(row) for row in rows))
 
 
-@router.post("/leads/{convo}/reply", dependencies=[Depends(require_staff)])
+@router.post("/leads/{convo}/reply", dependencies=[Depends(require_leads_edit)])
 async def reply(convo: str, body: ReplyBody):
     platform, entry_id, sender_id = _split_convo(convo)
     text = body.text.strip()
@@ -264,7 +303,7 @@ async def reply(convo: str, body: ReplyBody):
     return {"ok": True}
 
 
-@router.post("/leads/{convo}/attachment", dependencies=[Depends(require_staff)])
+@router.post("/leads/{convo}/attachment", dependencies=[Depends(require_leads_edit)])
 async def send_attachment(convo: str, file: UploadFile = File(...)):
     platform, entry_id, sender_id = _split_convo(convo)
     content_type = file.content_type or ""
@@ -302,7 +341,7 @@ async def send_attachment(convo: str, file: UploadFile = File(...)):
     return {"ok": True}
 
 
-@router.post("/leads/{convo}/takeover", dependencies=[Depends(require_staff)])
+@router.post("/leads/{convo}/takeover", dependencies=[Depends(require_leads_edit)])
 async def takeover(convo: str, body: TakeoverBody):
     _split_convo(convo)
     if body.muted:
