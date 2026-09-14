@@ -130,6 +130,11 @@ async def mute(convo: str, hours: float) -> None:
     await _upsert_thread(convo, {"muted_until": until})
 
 
+async def unmute(convo: str) -> None:
+    """End a human takeover early and hand the conversation back to the bot."""
+    await _upsert_thread(convo, {"muted_until": 0})
+
+
 async def is_muted(convo: str) -> bool:
     row = await _get_thread(convo)
     return bool(row) and (row.get("muted_until") or 0) > int(time.time())

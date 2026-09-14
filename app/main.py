@@ -12,9 +12,10 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
-from . import meta, store, supa
+from . import dashboard, meta, store, supa
 from .brain import describe_media, draft_reply
 from .config import DEBOUNCE_SECONDS, HANDOFF_HOURS, VERIFY_TOKEN
 
@@ -42,9 +43,24 @@ async def lifespan(_: FastAPI):
     await meta.aclose()
     await supa.aclose()
     await store.aclose()
+    await dashboard.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
+
+# The dashboard API is called from the browser (the website's Leads tab), so
+# it needs actual CORS headers - unlike /webhook, which only Meta's servers
+# ever call. Wide open on origin because the real gate is the bearer token
+# `require_staff` checks on every route: without a valid signed-in session,
+# an allowed origin buys an attacker nothing.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+app.include_router(dashboard.router, prefix="/dashboard")
 
 
 @app.get("/health")

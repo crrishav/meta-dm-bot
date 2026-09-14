@@ -78,5 +78,25 @@ async def upload_media(convo: str, data: bytes, mime_type: str) -> Optional[str]
         return None
 
 
+async def sign_media_url(path: str, expires_in: int = 3600) -> Optional[str]:
+    """A temporary public link to an archived attachment, for the dashboard to
+    render - the bucket is private, so the raw storage path is not fetchable
+    on its own."""
+    try:
+        response = await _http.post(
+            f"{SUPABASE_URL}/storage/v1/object/sign/{BUCKET}/{path}",
+            headers={**_headers, "Content-Type": "application/json"},
+            json={"expiresIn": expires_in},
+        )
+        if response.status_code >= 400:
+            log.warning("sign_media_url failed (%s): %s", response.status_code, response.text)
+            return None
+        signed = response.json().get("signedURL")
+        return f"{SUPABASE_URL}/storage/v1{signed}" if signed else None
+    except httpx.HTTPError as exc:
+        log.warning("sign_media_url error: %s", exc)
+        return None
+
+
 async def aclose() -> None:
     await _http.aclose()

@@ -31,6 +31,10 @@ MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
 SUPABASE_URL = _required("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = _required("SUPABASE_SERVICE_KEY")
+# The public anon key - used only to ask PostgREST to check a caller's own
+# session token on dashboard requests, the same way the website's Supabase
+# client already does for every query. Never used to read or write data.
+SUPABASE_ANON_KEY = _required("SUPABASE_ANON_KEY")
 
 # The bot's brief lives in a markdown file so non-engineers can edit it.
 PERSONA = Path(os.environ.get("PERSONA_FILE", "persona.md")).read_text(encoding="utf-8")
