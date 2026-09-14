@@ -1,144 +1,184 @@
-"""SQLite-backed conversation state.
+"""Supabase-backed conversation state - the operational store, not just an
+archive.
 
-Deliberately boring: one file, no ORM, no migrations. Swap for Postgres by
-replacing the four helpers at the bottom if you outgrow it.
+Render's free tier wipes the local disk on every spin-down (which happens
+after as little as 15 minutes of inactivity), so anything the bot actually
+depends on - dedup, mute state, prompt history - has to live somewhere that
+isn't local disk. Local SQLite would silently reset several times a day.
 """
 
-import sqlite3
-import threading
+import logging
 import time
 from typing import Optional
 
-from .config import DB_PATH, MAX_HISTORY
+import httpx
 
-_lock = threading.Lock()
-_conn: Optional[sqlite3.Connection] = None
+from .config import MAX_HISTORY, SUPABASE_SERVICE_KEY, SUPABASE_URL
+
+log = logging.getLogger(__name__)
+
+_headers = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "Content-Type": "application/json",
+}
+_http = httpx.AsyncClient(timeout=10.0)
 
 
 def init() -> None:
-    global _conn
-    _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    _conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS seen_mids (
-            mid TEXT PRIMARY KEY,
-            ts  INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sent_mids (
-            mid TEXT PRIMARY KEY,
-            ts  INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS messages (
-            id    INTEGER PRIMARY KEY AUTOINCREMENT,
-            convo TEXT NOT NULL,
-            role  TEXT NOT NULL,
-            text  TEXT NOT NULL,
-            ts    INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS messages_convo_idx ON messages (convo, id);
-        CREATE TABLE IF NOT EXISTS threads (
-            convo       TEXT PRIMARY KEY,
-            muted_until INTEGER NOT NULL DEFAULT 0,
-            referral    TEXT
-        );
-        """
-    )
-    try:
-        _conn.execute("ALTER TABLE threads ADD COLUMN referral TEXT")
-        _conn.commit()
-    except sqlite3.OperationalError:
-        pass  # already there - CREATE TABLE above only runs on a fresh db
-    _conn.commit()
+    """No-op - tables live in Supabase, created once via supabase_schema.sql,
+    not per-process. Kept so the app's startup hook does not need to change."""
 
 
-def _now() -> int:
-    return int(time.time())
-
-
-def claim_mid(mid: str) -> bool:
+async def claim_mid(mid: str) -> bool:
     """Return True the first time we see a message id, False on redelivery.
 
     Meta retries webhooks it thinks failed, so without this the customer gets
     the same reply two or three times.
     """
-    with _lock:
-        try:
-            _conn.execute("INSERT INTO seen_mids (mid, ts) VALUES (?, ?)", (mid, _now()))
-            _conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-
-def record_sent_mid(mid: str) -> None:
-    with _lock:
-        _conn.execute(
-            "INSERT OR IGNORE INTO sent_mids (mid, ts) VALUES (?, ?)", (mid, _now())
+    try:
+        response = await _http.post(
+            f"{SUPABASE_URL}/rest/v1/ig_bot_seen_mids",
+            headers=_headers,
+            json={"mid": mid},
         )
-        _conn.commit()
+    except httpx.HTTPError as exc:
+        log.warning("claim_mid error (%s) - failing open", exc)
+        return True  # never block a real reply over a dedup-check hiccup
+    if response.status_code == 201:
+        return True
+    if response.status_code == 409:
+        return False
+    log.warning("claim_mid unexpected status (%s): %s", response.status_code, response.text)
+    return True
 
 
-def was_sent_by_us(mid: str) -> bool:
-    with _lock:
-        row = _conn.execute("SELECT 1 FROM sent_mids WHERE mid = ?", (mid,)).fetchone()
-    return row is not None
-
-
-def add_message(convo: str, role: str, text: str) -> None:
-    with _lock:
-        _conn.execute(
-            "INSERT INTO messages (convo, role, text, ts) VALUES (?, ?, ?, ?)",
-            (convo, role, text, _now()),
+async def record_sent_mid(mid: str) -> None:
+    try:
+        await _http.post(
+            f"{SUPABASE_URL}/rest/v1/ig_bot_sent_mids",
+            headers={**_headers, "Prefer": "resolution=ignore-duplicates"},
+            json={"mid": mid},
         )
-        _conn.commit()
+    except httpx.HTTPError as exc:
+        log.warning("record_sent_mid failed: %s", exc)
 
 
-def history(convo: str) -> list[dict]:
+async def was_sent_by_us(mid: str) -> bool:
+    try:
+        response = await _http.get(
+            f"{SUPABASE_URL}/rest/v1/ig_bot_sent_mids",
+            headers=_headers,
+            params={"mid": f"eq.{mid}", "select": "mid"},
+        )
+        return response.status_code == 200 and len(response.json()) > 0
+    except httpx.HTTPError as exc:
+        log.warning("was_sent_by_us error: %s", exc)
+        return False
+
+
+async def add_message(
+    convo: str,
+    role: str,
+    text: str,
+    referral: Optional[str] = None,
+    reply_to_mid: Optional[str] = None,
+) -> None:
+    try:
+        response = await _http.post(
+            f"{SUPABASE_URL}/rest/v1/ig_bot_messages",
+            headers=_headers,
+            json={
+                "convo": convo,
+                "role": role,
+                "content": text,
+                "referral": referral,
+                "reply_to_mid": reply_to_mid,
+            },
+        )
+        if response.status_code >= 400:
+            log.error("add_message failed (%s): %s", response.status_code, response.text)
+    except httpx.HTTPError as exc:
+        log.error("add_message error: %s", exc)
+
+
+async def history(convo: str) -> list[dict]:
     """Recent turns, oldest first, as {role, content} dicts."""
-    with _lock:
-        rows = _conn.execute(
-            "SELECT role, text FROM messages WHERE convo = ? ORDER BY id DESC LIMIT ?",
-            (convo, MAX_HISTORY),
-        ).fetchall()
-    return [{"role": role, "content": text} for role, text in reversed(rows)]
-
-
-def mute(convo: str, hours: float) -> None:
-    until = _now() + int(hours * 3600)
-    with _lock:
-        _conn.execute(
-            "INSERT INTO threads (convo, muted_until) VALUES (?, ?) "
-            "ON CONFLICT(convo) DO UPDATE SET muted_until = excluded.muted_until",
-            (convo, until),
+    try:
+        response = await _http.get(
+            f"{SUPABASE_URL}/rest/v1/ig_bot_messages",
+            headers=_headers,
+            params={
+                "convo": f"eq.{convo}",
+                "select": "role,content",
+                "order": "created_at.desc",
+                "limit": str(MAX_HISTORY),
+            },
         )
-        _conn.commit()
+        if response.status_code >= 400:
+            log.error("history fetch failed (%s): %s", response.status_code, response.text)
+            return []
+        rows = response.json()
+        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    except httpx.HTTPError as exc:
+        log.error("history fetch error: %s", exc)
+        return []
 
 
-def is_muted(convo: str) -> bool:
-    with _lock:
-        row = _conn.execute(
-            "SELECT muted_until FROM threads WHERE convo = ?", (convo,)
-        ).fetchone()
-    return bool(row) and row[0] > _now()
+async def mute(convo: str, hours: float) -> None:
+    until = int(time.time() + hours * 3600)
+    await _upsert_thread(convo, {"muted_until": until})
 
 
-def set_referral(convo: str, referral: str) -> None:
+async def is_muted(convo: str) -> bool:
+    row = await _get_thread(convo)
+    return bool(row) and (row.get("muted_until") or 0) > int(time.time())
+
+
+async def set_referral(convo: str, referral: str) -> None:
     """Record which ad started this conversation - first-touch only, so a
     later message from an unrelated ad click mid-thread does not overwrite
     the story of how the lead actually arrived."""
-    with _lock:
-        _conn.execute(
-            "INSERT INTO threads (convo, referral) VALUES (?, ?) "
-            "ON CONFLICT(convo) DO UPDATE SET referral = excluded.referral "
-            "WHERE threads.referral IS NULL",
-            (convo, referral),
+    row = await _get_thread(convo)
+    if row and row.get("referral"):
+        return
+    await _upsert_thread(convo, {"referral": referral})
+
+
+async def get_referral(convo: str) -> Optional[str]:
+    row = await _get_thread(convo)
+    return row.get("referral") if row else None
+
+
+async def _get_thread(convo: str) -> Optional[dict]:
+    try:
+        response = await _http.get(
+            f"{SUPABASE_URL}/rest/v1/ig_bot_threads",
+            headers=_headers,
+            params={"convo": f"eq.{convo}", "select": "muted_until,referral"},
         )
-        _conn.commit()
+        if response.status_code >= 400:
+            log.warning("thread fetch failed (%s): %s", response.status_code, response.text)
+            return None
+        rows = response.json()
+        return rows[0] if rows else None
+    except httpx.HTTPError as exc:
+        log.warning("thread fetch error: %s", exc)
+        return None
 
 
-def get_referral(convo: str) -> Optional[str]:
-    with _lock:
-        row = _conn.execute(
-            "SELECT referral FROM threads WHERE convo = ?", (convo,)
-        ).fetchone()
-    return row[0] if row else None
+async def _upsert_thread(convo: str, fields: dict) -> None:
+    try:
+        response = await _http.post(
+            f"{SUPABASE_URL}/rest/v1/ig_bot_threads",
+            headers={**_headers, "Prefer": "resolution=merge-duplicates"},
+            json={"convo": convo, **fields},
+        )
+        if response.status_code >= 400:
+            log.warning("thread upsert failed (%s): %s", response.status_code, response.text)
+    except httpx.HTTPError as exc:
+        log.warning("thread upsert error: %s", exc)
+
+
+async def aclose() -> None:
+    await _http.aclose()

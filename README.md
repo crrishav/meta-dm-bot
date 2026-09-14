@@ -1,68 +1,76 @@
 # Meta DM auto-reply bot
 
-Answers Instagram and Messenger DMs from people who clicked your ads, using
-Google's Gemini. One Python service handles both platforms - they share the same
-webhook, the same Page token, and the same Send API.
+Reads and replies to Instagram DMs using Google's Gemini - text, photos, and
+voice notes - via the Instagram API with Instagram Login (no linked Facebook
+Page required).
 
 ## How it works
 
 ```
-Customer DMs your Page/IG
+Customer DMs your Instagram account
         |
         v
   Meta webhook  --POST-->  /webhook   (verify signature, return 200 in ms)
                               |
                               v
                     background task
-                      - dedupe by message id
+                      - dedupe by message id (Supabase)
                       - wait 2s in case they are still typing
-                      - load last 20 turns from SQLite
-                      - ask Gemini for a reply
-                      - send it back via Graph API
+                      - download any photo/voice note, archive it permanently
+                        in Supabase Storage (Meta's CDN links expire)
+                      - load recent history from Supabase
+                      - ask Gemini for a reply - it can see the photo and
+                        listen to the voice note directly
+                      - send it back via the Graph API
                       - if it needs a person, mute the thread and alert
 ```
 
+Everything stateful - dedup, mute state, conversation history - lives in
+Supabase, not on local disk. That matters if you deploy anywhere with an
+ephemeral filesystem (see `DEPLOY.md`): the bot survives a restart with zero
+memory loss.
+
 Three things it does that a naive bot gets wrong:
 
-- **Echo detection.** When a teammate answers from the Page inbox, Meta sends
-  us an echo of their message. The bot recognises it is not one of ours and
-  goes quiet on that thread for 12 hours instead of talking over your staff.
+- **Echo detection.** When a teammate answers from the inbox directly, Meta
+  sends us an echo of their message. The bot recognises it is not one of
+  ours and goes quiet on that thread for 12 hours instead of talking over
+  your staff.
 - **Deduplication.** Meta retries webhooks it thinks failed. Message ids are
-  claimed in SQLite so a retry cannot produce a second reply.
+  claimed in Supabase so a retry cannot produce a second reply.
 - **Debounce.** People send "hi" / "is this available" / "how much" as three
-  messages. The bot waits for the pause and answers once, with all three in
-  context.
+  separate messages (or a photo, then a voice note a few seconds later). The
+  bot waits for the pause and answers once, with everything in context.
 
 ## Setup
 
 ### 1. Meta app configuration
 
-In the App Dashboard for your app:
+In [developers.facebook.com](https://developers.facebook.com), your app ->
+**Use cases -> Instagram API**:
 
-1. **Add products:** Messenger, and Instagram (Instagram messaging via
-   Facebook Login).
-2. **Link your Page** under Messenger -> Settings, and confirm the Instagram
-   professional account is connected to that same Page.
-3. **Permissions you need:**
-   - `pages_messaging`, `pages_manage_metadata`, `pages_show_list`,
-     `pages_read_engagement` (Messenger)
-   - `instagram_basic`, `instagram_manage_messages` (Instagram)
-4. **App Review + Business Verification.** Until these are approved your app
-   has Standard Access, which means it can only message people who hold a role
-   on the app. Add yourself as a tester and build against that; submit for
-   Advanced Access in parallel, because verification takes days to weeks.
+1. Add the **Instagram API** use case (not Messenger - this bot uses
+   Instagram API with Instagram Login, a standalone product that does not
+   need a linked Facebook Page).
+2. **Permissions and features**: `instagram_business_basic`,
+   `instagram_business_manage_messages`. Standard Access is enough as long
+   as the account you're messaging is added as an Instagram Tester on the
+   app (App Roles -> Instagram Testers) and has accepted the invite.
+3. **API setup with Instagram login** -> step 2 "Generate access tokens" ->
+   generate a token for your account. Put it in `.env` as `META_IG_TOKEN`,
+   and its id as `META_IG_ID`.
+4. Same page -> **Instagram app secret** (Show button) - this is a
+   *different* secret from your main App Secret. Put it in `.env` as
+   `META_IG_APP_SECRET`. Meta signs webhook payloads with this one, not the
+   main App Secret - mixing them up looks like a signature bug but isn't.
 
-### 2. Get a Page token
+### 2. Set up Supabase
 
-Generate a user token in the Graph API Explorer with the permissions above,
-then:
-
-```bash
-python tools/get_page_token.py <APP_ID> <APP_SECRET> <EXPLORER_TOKEN>
-```
-
-Put the printed `META_PAGE_TOKEN` in `.env`. It does not expire, as long as the
-exchange succeeded - treat it like a password.
+Run `supabase_schema.sql` in your project's SQL Editor - it creates every
+table this bot uses (`ig_bot_*`, clearly separated from anything else in the
+same project) plus a private storage bucket for media. Put your project URL
+and **service role** key (not the anon key - this is a trusted backend) in
+`.env` as `SUPABASE_URL` / `SUPABASE_SERVICE_KEY`.
 
 ### 3. Run the server
 
@@ -74,59 +82,69 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 Edit `persona.md` before going live. The bot is instructed never to state a
-fact that is not in that file - anything missing becomes a handoff instead of
-an invented answer.
+fact that is not in that file - anything missing becomes a handoff instead
+of an invented answer.
 
 ### 4. Expose it over HTTPS
 
 Meta pushes to you; there is no polling endpoint, so the server must be
-publicly reachable with a valid certificate. Deploy to Render / Railway / Fly /
-a VPS behind nginx. For local development:
+publicly reachable with a valid certificate. See `DEPLOY.md` for Render. For
+local development:
 
 ```bash
 cloudflared tunnel --url http://localhost:8000
 ```
 
-### 5. Point Meta at it
+### 5. Point Meta at it - **two places, not one**
 
-In the dashboard, under Webhooks:
+**a) App-level:** Use cases -> Instagram API -> Customize -> **Webhooks** ->
+select the **Instagram** product row -> Callback URL + Verify token ->
+Verify and save -> subscribe to `messages` and `messaging_referral`.
 
-- Callback URL: `https://your-domain/webhook`
-- Verify token: the same random string you put in `META_VERIFY_TOKEN`
-- Subscribe the **page** object to: `messages`, `messaging_postbacks`,
-  `message_echoes`, `messaging_referrals`
-- Subscribe the **instagram** object to: `messages`
+**b) Product-level (the one that actually matters for delivery):** same
+Customize section -> **API setup with Instagram login** -> step 3 "Configure
+webhooks" -> the *same* Callback URL + Verify token -> Verify and save.
 
-Then subscribe the Page itself - the dashboard step alone is not enough:
+Confirmed the hard way: (a) alone will pass verification and look fully
+configured while never actually delivering a single message. Only (b) turns
+on live delivery for this product. Do both.
 
-```bash
-python tools/subscribe_page.py <PAGE_ID>
+Then self-subscribe the account (one-time, from a Python shell with the venv
+active):
+
+```python
+import httpx, os
+from dotenv import load_dotenv
+load_dotenv()
+httpx.post(
+    f"https://graph.instagram.com/v21.0/{os.environ['META_IG_ID']}/subscribed_apps",
+    params={"subscribed_fields": "messages,messaging_referral", "access_token": os.environ["META_IG_TOKEN"]},
+)
 ```
 
-DM your Page from an account that has a tester role. You should see the reply.
+DM the account from a tester account. You should see the reply.
 
 ## Things that will bite you
 
 | Symptom | Cause |
 |---|---|
 | Webhook verification fails | `META_VERIFY_TOKEN` does not match what you typed in the dashboard |
-| 403 on every POST | `META_APP_SECRET` is wrong, or a proxy is re-encoding the body before the signature check |
-| Nothing arrives at all | `subscribe_page.py` was never run, or the Page is not linked to the app |
-| "No matching user found" on send | You are still on Standard Access and that person is not a tester |
-| Works for an hour then dies | You put the Explorer token in `.env` instead of the Page token |
-| Replies stop after a day | The 24-hour messaging window closed - you may only reply within 24h of the customer's last message |
+| Verification passes, nothing ever arrives | You only configured webhook (a) above, not (b) - see step 5 |
+| 403 "bad signature" on every POST | You're signing/checking against `META_APP_SECRET` instead of `META_IG_APP_SECRET` - they are different secrets |
+| Voice note attachment fails to download | Instagram serves voice notes as `video/mp4`, not `audio/*` - `download_media` in `app/meta.py` already accounts for this, but if you touch that check, keep it |
+| Token stops working after ~1 hour | You saved a short-lived token. Exchange it, or just regenerate from the API setup page - it's quick |
+| Gemini quota exhausted fast | Some Gemini model IDs (notably the newest ones) get a tiny free-tier daily cap. `gemini-2.5-flash` has a far higher one for the same capability - check `aistudio.google.com` if replies start silently falling back to the generic message |
+| Replies stop after a day | The 24-hour messaging window closed - you may only reply within 24h of the customer's last message (or use a `messaging_referral`-tagged first contact) |
 
 ## Cost
 
-Each reply is roughly 1-2k input tokens and under 100 output.
-`gemini-2.5-flash` has a free tier that is generous enough for early testing -
-check current rate limits at aistudio.google.com, since a busy ad campaign can
-outrun them. Set `GEMINI_MODEL` in `.env` to switch models.
+Each reply is roughly 1-2k input tokens and well under 100 output.
+`gemini-2.5-flash`'s free tier is generous enough for real early usage;
+check current rate limits at aistudio.google.com since volume can outrun
+them. Set `GEMINI_MODEL` in `.env` to switch models.
 
 ## Where to take it next
 
 - Persist leads to your CRM in `notify_team()` in `app/main.py`.
-- Read `messaging_referrals` to learn which ad each lead came from, and put
-  that in the prompt.
-- Swap SQLite for Postgres if you run more than one instance - the `store`
-  module is the only file that touches the database.
+- `app/store.py` and `app/supa.py` are the only files that touch Supabase -
+  swap the backend there if you ever outgrow it.

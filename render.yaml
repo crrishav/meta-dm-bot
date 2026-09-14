@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: kazi-dm-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: META_APP_ID
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: GRAPH_VERSION
+        value: v26.0
+      - key: META_IG_ID
+        sync: false
+      - key: META_IG_TOKEN
+        sync: false
+      - key: META_IG_APP_SECRET
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: PERSONA_FILE
+        value: persona.md
+      - key: DEBOUNCE_SECONDS
+        value: "2"
+      - key: HANDOFF_HOURS
+        value: "12"
+      - key: MAX_HISTORY
+        value: "20"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false

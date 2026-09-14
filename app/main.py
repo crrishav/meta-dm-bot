@@ -41,6 +41,7 @@ async def lifespan(_: FastAPI):
     yield
     await meta.aclose()
     await supa.aclose()
+    await store.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -145,20 +146,19 @@ def _extract_referral(event: dict) -> Optional[str]:
     return f"{source} link (ref: {ref})" if ref else source
 
 
-def _handle_echo(platform: str, entry_id: str, event: dict, message: dict) -> None:
+async def _handle_echo(platform: str, entry_id: str, event: dict, message: dict) -> None:
     """A message we did not send went out from the Page - a teammate is
     handling this lead. Go quiet rather than talking over them."""
     mid = message.get("mid", "")
-    if not mid or store.was_sent_by_us(mid):
+    if not mid or await store.was_sent_by_us(mid):
         return
     customer_id = (event.get("recipient") or {}).get("id")
     if not customer_id:
         return
     convo = f"{platform}:{entry_id}:{customer_id}"
     text = message.get("text", "")
-    store.add_message(convo, "assistant", text)
-    asyncio.create_task(supa.log_message(convo, "assistant", text))
-    store.mute(convo, HANDOFF_HOURS)
+    await store.add_message(convo, "assistant", text)
+    await store.mute(convo, HANDOFF_HOURS)
     log.info("human replied in %s - muting bot for %sh", convo, HANDOFF_HOURS)
 
 
@@ -169,7 +169,7 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
     # It must be checked before the self-loop guard below, which would
     # otherwise drop it.
     if message.get("is_echo"):
-        _handle_echo(platform, entry_id, event, message)
+        await _handle_echo(platform, entry_id, event, message)
         return
 
     sender_id = (event.get("sender") or {}).get("id")
@@ -180,29 +180,28 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
 
     referral = _extract_referral(event)
     if referral:
-        store.set_referral(convo, referral)
+        await store.set_referral(convo, referral)
 
     # Delivery receipts, read receipts, reactions.
     if not message and "postback" not in event:
         return
 
     mid = message.get("mid")
-    if mid and not store.claim_mid(mid):
+    if mid and not await store.claim_mid(mid):
         return  # redelivery
 
     text = _extract_text(event)
     if not text:
         return
 
-    store.add_message(convo, "user", text)
     reply_to_mid = _extract_reply_to(event)
-    asyncio.create_task(supa.log_message(convo, "user", text, referral=referral, reply_to_mid=reply_to_mid))
+    await store.add_message(convo, "user", text, referral=referral, reply_to_mid=reply_to_mid)
     # Trimmed to the cap on every append (not just at send time) so a muted
     # conversation can't accumulate an unbounded list over a long mute.
     pending = _pending_media[convo] + _extract_media_urls(event)
     _pending_media[convo] = pending[-MAX_MEDIA_PER_TURN:]
 
-    if store.is_muted(convo):
+    if await store.is_muted(convo):
         log.info("%s is muted - logged but not replying", convo)
         return
 
@@ -224,19 +223,17 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
         for data, mime_type in media:
             asyncio.create_task(_archive_media(convo, data, mime_type))
 
-        reply, handoff = await draft_reply(
-            store.history(convo), name, media, store.get_referral(convo)
-        )
+        history = await store.history(convo)
+        reply, handoff = await draft_reply(history, name, media, await store.get_referral(convo))
 
         sent_mid = await meta.send_text(entry_id, sender_id, reply[:1900], platform)
         if sent_mid:
-            store.record_sent_mid(sent_mid)
-        store.add_message(convo, "assistant", reply)
-        asyncio.create_task(supa.log_message(convo, "assistant", reply))
+            await store.record_sent_mid(sent_mid)
+        await store.add_message(convo, "assistant", reply)
 
         if handoff:
-            store.mute(convo, HANDOFF_HOURS)
-            await notify_team(convo, store.history(convo))
+            await store.mute(convo, HANDOFF_HOURS)
+            await notify_team(convo, await store.history(convo))
 
 
 async def _archive_media(convo: str, data: bytes, mime_type: str) -> None:

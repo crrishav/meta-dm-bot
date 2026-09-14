@@ -28,7 +28,6 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 DEBOUNCE_SECONDS = float(os.environ.get("DEBOUNCE_SECONDS", "2"))
 HANDOFF_HOURS = float(os.environ.get("HANDOFF_HOURS", "12"))
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
-DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
 SUPABASE_URL = _required("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = _required("SUPABASE_SERVICE_KEY")
