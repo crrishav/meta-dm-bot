@@ -53,6 +53,27 @@ async def send_text(entry_id: str, recipient_id: str, text: str, platform: str) 
     return response.json().get("message_id")
 
 
+async def send_attachment(entry_id: str, recipient_id: str, kind: str, url: str) -> Optional[str]:
+    """Send an image or voice note by URL - same shape as send_text, just an
+    attachment instead of text. `url` must be reachable by Meta's servers at
+    the moment they fetch it; a short-lived Supabase signed URL is fine since
+    the fetch happens synchronously on their side, not queued.
+
+    There is no attachment_id/upload-first path here: the Attachment Upload
+    API is Messenger-Platform/Page-only and does not work with the Instagram
+    API with Instagram Login this bot uses, so every send goes by URL.
+    """
+    response = await _http.post(
+        f"{GRAPH_IG}/{entry_id}/messages",
+        params={"access_token": IG_TOKEN},
+        json={"recipient": {"id": recipient_id}, "message": {"attachment": {"type": kind, "payload": {"url": url}}}},
+    )
+    if response.status_code >= 400:
+        log.error("send_attachment failed (%s): %s", response.status_code, response.text)
+        return None
+    return response.json().get("message_id")
+
+
 async def send_typing(entry_id: str, recipient_id: str) -> None:
     """Best effort - a failed typing bubble should never block the reply."""
     try:
@@ -79,6 +100,25 @@ async def profile_name(entry_id: str, user_id: str) -> Optional[str]:
         return full_name.split()[0] if full_name else None
     except httpx.HTTPError:
         return None
+
+
+async def profile_info(entry_id: str, user_id: str) -> dict:
+    """Full name and profile picture, for the dashboard's lead list. A
+    separate call from profile_name() (used on the live reply path) so this
+    stays purely additive - one Graph call, never touched by message sending.
+    The picture URL Meta returns expires after a few days, so callers should
+    cache this briefly, not indefinitely."""
+    try:
+        response = await _http.get(
+            f"{GRAPH_IG}/{user_id}",
+            params={"fields": "name,profile_pic", "access_token": IG_TOKEN},
+        )
+        if response.status_code >= 400:
+            return {"name": None, "profilePic": None}
+        data = response.json()
+        return {"name": data.get("name"), "profilePic": data.get("profile_pic")}
+    except httpx.HTTPError:
+        return {"name": None, "profilePic": None}
 
 
 async def download_media(url: str) -> Optional[tuple[bytes, str]]:

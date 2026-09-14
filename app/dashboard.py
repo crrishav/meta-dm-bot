@@ -16,11 +16,13 @@ go quiet for the same reason.
 
 import asyncio
 import logging
+import re
 import time
+from datetime import datetime
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from . import meta, store, supa
@@ -42,9 +44,17 @@ _headers = {
 # convo" database view instead.
 LIST_SCAN_LIMIT = 1000
 
-# Instagram profile names never change mid-conversation, so a lookup is
-# cached for the process lifetime rather than re-fetched on every poll.
-_name_cache: dict[str, Optional[str]] = {}
+# The picture URL Meta returns expires after a few days (per their own docs),
+# so this is cached briefly rather than for the process lifetime the way the
+# old name-only cache was.
+PROFILE_CACHE_SECONDS = 12 * 3600
+_profile_cache: dict[str, tuple[dict, float]] = {}
+
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+# Meta fetches the attachment URL synchronously at send time, not on a queue -
+# a short-lived signed URL is plenty, and keeps the file from being fetchable
+# by anyone who intercepts the request any longer than necessary.
+SEND_URL_TTL_SECONDS = 300
 
 
 async def require_staff(authorization: Optional[str] = Header(None)) -> None:
@@ -75,17 +85,20 @@ def _split_convo(convo: str) -> tuple[str, str, str]:
     return parts[0], parts[1], parts[2]
 
 
-async def _profile_name(convo: str, entry_id: str, sender_id: str) -> Optional[str]:
-    if convo not in _name_cache:
-        _name_cache[convo] = await meta.profile_name(entry_id, sender_id)
-    return _name_cache[convo]
+async def _profile(convo: str, entry_id: str, sender_id: str) -> dict:
+    cached = _profile_cache.get(convo)
+    if cached and time.time() - cached[1] < PROFILE_CACHE_SECONDS:
+        return cached[0]
+    info = await meta.profile_info(entry_id, sender_id)
+    _profile_cache[convo] = (info, time.time())
+    return info
 
 
 async def _fetch_threads() -> dict[str, dict]:
     response = await _http.get(
         f"{SUPABASE_URL}/rest/v1/ig_bot_threads",
         headers=_headers,
-        params={"select": "convo,muted_until,referral"},
+        params={"select": "convo,muted_until,referral,value_score,value_tier,value_reasons"},
     )
     if response.status_code >= 400:
         log.error("thread list fetch failed (%s): %s", response.status_code, response.text)
@@ -128,14 +141,20 @@ async def list_leads():
         platform, entry_id, sender_id = convo.split(":", 2)
         thread = threads.get(convo, {})
         muted_until = thread.get("muted_until") or 0
-        name = await _profile_name(convo, entry_id, sender_id)
+        profile = await _profile(convo, entry_id, sender_id)
         return {
             "convo": convo,
             "platform": platform,
-            "name": name,
+            "name": profile.get("name"),
+            "profilePic": profile.get("profilePic"),
             "referral": thread.get("referral"),
             "mutedUntil": muted_until,
             "isMuted": muted_until > int(time.time()),
+            "value": {
+                "score": thread.get("value_score"),
+                "tier": thread.get("value_tier"),
+                "reasons": thread.get("value_reasons") or [],
+            },
             "lastMessage": {
                 "role": last["role"],
                 "content": last["content"],
@@ -148,6 +167,59 @@ async def list_leads():
     return sorted(leads, key=lambda lead: lead["lastMessage"]["createdAt"], reverse=True)
 
 
+_PLACEHOLDER_RE = re.compile(r"^\[customer sent: .+\]$")
+
+
+def _parse_ts(iso: str) -> float:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _drop_placeholder_duplicates(rows: list[dict]) -> list[dict]:
+    """main.py logs a placeholder like "[customer sent: image]" synchronously
+    for every inbound attachment, so Gemini has something to read before the
+    media finishes downloading - then _archive_media logs a second row with
+    the real media a moment later. Both land in this same table, so without
+    this the dashboard would show two bubbles for one attachment. Drop the
+    placeholder only when a real media row for the same side shows up within
+    a few seconds right after it."""
+    out = []
+    for i, row in enumerate(rows):
+        if row.get("media_path") or not _PLACEHOLDER_RE.match(row.get("content") or ""):
+            out.append(row)
+            continue
+        this_time = _parse_ts(row["created_at"])
+        shadowed = any(
+            other["role"] == row["role"]
+            and other.get("media_path")
+            and abs(_parse_ts(other["created_at"]) - this_time) <= 30
+            for other in rows[i + 1 : i + 4]
+        )
+        if not shadowed:
+            out.append(row)
+    return out
+
+
+def _reply_label(target: dict) -> str:
+    if target.get("content"):
+        return target["content"]
+    media_type = target.get("media_type") or ""
+    return "Photo" if media_type.startswith("image/") else "Voice note" if media_type else ""
+
+
+def _attach_reply_previews(rows: list[dict]) -> list[dict]:
+    """The customer's own `reply_to_mid` (captured on receive) resolved to an
+    actual earlier row via that row's own `mid`, so the thread can show a
+    quote strip the way the Instagram app itself does."""
+    by_mid = {row["mid"]: row for row in rows if row.get("mid")}
+    out = []
+    for row in rows:
+        target = by_mid.get(row.get("reply_to_mid"))
+        if target and target["id"] != row["id"]:
+            row = {**row, "replyTo": {"id": target["id"], "content": _reply_label(target), "mediaType": target.get("media_type")}}
+        out.append(row)
+    return out
+
+
 @router.get("/leads/{convo}/messages", dependencies=[Depends(require_staff)])
 async def lead_messages(convo: str):
     _split_convo(convo)
@@ -156,7 +228,7 @@ async def lead_messages(convo: str):
         headers=_headers,
         params={
             "convo": f"eq.{convo}",
-            "select": "id,role,content,media_type,media_path,referral,reply_to_mid,created_at",
+            "select": "id,role,content,media_type,media_path,referral,reply_to_mid,mid,created_at",
             "order": "created_at.asc",
             "limit": "500",
         },
@@ -165,7 +237,7 @@ async def lead_messages(convo: str):
         log.error("message fetch failed (%s): %s", response.status_code, response.text)
         raise HTTPException(502, "Could not load this conversation.")
 
-    rows = response.json()
+    rows = _attach_reply_previews(_drop_placeholder_duplicates(response.json()))
 
     async def with_media_url(row: dict) -> dict:
         if row.get("media_path"):
@@ -187,7 +259,45 @@ async def reply(convo: str, body: ReplyBody):
         raise HTTPException(502, "Instagram did not accept the message.")
 
     await store.record_sent_mid(mid)
-    await store.add_message(convo, "assistant", text)
+    await store.add_message(convo, "assistant", text, mid=mid)
+    await store.mute(convo, HANDOFF_HOURS)
+    return {"ok": True}
+
+
+@router.post("/leads/{convo}/attachment", dependencies=[Depends(require_staff)])
+async def send_attachment(convo: str, file: UploadFile = File(...)):
+    platform, entry_id, sender_id = _split_convo(convo)
+    content_type = file.content_type or ""
+    if content_type.startswith("image/"):
+        kind, label = "image", "Photo"
+    elif content_type.startswith("audio/") or content_type.startswith("video/"):
+        # Browser voice recordings commonly arrive as audio/webm; a handful of
+        # browsers hand MediaRecorder a video/* container for an audio-only
+        # capture the same way Instagram's own voice notes do on receive
+        # (app/meta.py's download_media has the same note) - both are a
+        # voice note as far as sending is concerned.
+        kind, label = "audio", "Voice note"
+    else:
+        raise HTTPException(400, "Only images and voice notes can be sent from here.")
+
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(400, "That file is too large.")
+
+    path = await supa.upload_media(convo, data, content_type)
+    if not path:
+        raise HTTPException(502, "Could not store that file.")
+
+    url = await supa.sign_media_url(path, expires_in=SEND_URL_TTL_SECONDS)
+    if not url:
+        raise HTTPException(502, "Could not prepare that file to send.")
+
+    mid = await meta.send_attachment(entry_id, sender_id, kind, url)
+    if not mid:
+        raise HTTPException(502, "Instagram did not accept that file.")
+
+    await store.record_sent_mid(mid)
+    await supa.log_message(convo, "assistant", label, media_type=content_type, media_path=path, mid=mid)
     await store.mute(convo, HANDOFF_HOURS)
     return {"ok": True}
 

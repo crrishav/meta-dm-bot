@@ -19,6 +19,11 @@ create index if not exists ig_bot_messages_convo_idx
 -- on a specific earlier message instead of sending fresh.
 alter table ig_bot_messages add column if not exists reply_to_mid text;
 
+-- This row's own Meta message id, for both directions - lets reply_to_mid
+-- (above) be resolved to an actual row instead of just an opaque string.
+-- Nullable: rows written before this column existed have none, and that's fine.
+alter table ig_bot_messages add column if not exists mid text;
+
 -- ---- Operational state (not just archive) ----
 -- Render's free tier wipes local disk on every spin-down, so dedup and mute
 -- state have to live here instead of local SQLite to survive that.
@@ -44,3 +49,12 @@ create table if not exists ig_bot_threads (
     muted_until bigint not null default 0,
     referral    text
 );
+
+-- How much this lead looks worth chasing, assessed by Gemini from the
+-- conversation so far - shown on the dashboard's Leads list, not used by the
+-- bot's own reply logic. value_reasons is a JSON array of short strings, the
+-- evidence behind the score, so the number is never just asserted.
+alter table ig_bot_threads add column if not exists value_score int;
+alter table ig_bot_threads add column if not exists value_tier text;
+alter table ig_bot_threads add column if not exists value_reasons jsonb;
+alter table ig_bot_threads add column if not exists value_updated_at timestamptz;

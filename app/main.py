@@ -16,8 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
 from . import dashboard, meta, store, supa
-from .brain import describe_media, draft_reply
+from .brain import assess_value, describe_media, draft_reply
 from .config import DEBOUNCE_SECONDS, HANDOFF_HOURS, VERIFY_TOKEN
+
+# How often a thread's lead-value score is allowed to refresh - keeps the
+# Gemini scoring call proportional to real activity, not one per message.
+VALUE_COOLDOWN_MINUTES = 15
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("bot")
@@ -185,7 +189,7 @@ async def _handle_echo(platform: str, entry_id: str, event: dict, message: dict)
         return
     convo = f"{platform}:{entry_id}:{customer_id}"
     text = message.get("text", "")
-    await store.add_message(convo, "assistant", text)
+    await store.add_message(convo, "assistant", text, mid=mid)
     await store.mute(convo, HANDOFF_HOURS)
     log.info("human replied in %s - muting bot for %sh", convo, HANDOFF_HOURS)
 
@@ -223,7 +227,8 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
         return
 
     reply_to_mid = _extract_reply_to(event)
-    await store.add_message(convo, "user", text, referral=referral, reply_to_mid=reply_to_mid)
+    await store.add_message(convo, "user", text, referral=referral, reply_to_mid=reply_to_mid, mid=mid)
+    asyncio.create_task(_maybe_assess_value(convo, entry_id, sender_id))
     # Trimmed to the cap on every append (not just at send time) so a muted
     # conversation can't accumulate an unbounded list over a long mute.
     pending = _pending_media[convo] + _extract_media_urls(event)
@@ -257,11 +262,27 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
         sent_mid = await meta.send_text(entry_id, sender_id, reply[:1900], platform)
         if sent_mid:
             await store.record_sent_mid(sent_mid)
-        await store.add_message(convo, "assistant", reply)
+        await store.add_message(convo, "assistant", reply, mid=sent_mid)
 
         if handoff:
             await store.mute(convo, HANDOFF_HOURS)
             await notify_team(convo, await store.history(convo))
+
+
+async def _maybe_assess_value(convo: str, entry_id: str, sender_id: str) -> None:
+    """Score how much this lead looks worth chasing - fire-and-forget, same
+    as _archive_media. Rate limited via store.should_assess_value so a fast
+    back-and-forth doesn't spend a Gemini call on every single line."""
+    try:
+        if not await store.should_assess_value(convo, VALUE_COOLDOWN_MINUTES):
+            return
+        name = await meta.profile_name(entry_id, sender_id)
+        history = await store.history(convo)
+        result = await assess_value(history, name, await store.get_referral(convo))
+        if result:
+            await store.set_value(convo, result["score"], result["tier"], result["reasons"])
+    except Exception:
+        log.exception("value assessment failed for %s", convo)
 
 
 async def _archive_media(convo: str, data: bytes, mime_type: str) -> None:

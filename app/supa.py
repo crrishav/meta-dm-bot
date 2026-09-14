@@ -34,6 +34,7 @@ async def log_message(
     media_path: Optional[str] = None,
     referral: Optional[str] = None,
     reply_to_mid: Optional[str] = None,
+    mid: Optional[str] = None,
 ) -> None:
     """Append one message to the archive. Swallows every error - a failed
     write here should never surface to the customer."""
@@ -49,6 +50,7 @@ async def log_message(
                 "media_path": media_path,
                 "referral": referral,
                 "reply_to_mid": reply_to_mid,
+                "mid": mid,
             },
         )
         if response.status_code >= 400:

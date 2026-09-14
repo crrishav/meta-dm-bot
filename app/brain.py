@@ -1,5 +1,6 @@
 """Reply generation, using Google AI Studio (Gemini)."""
 
+import json
 import logging
 from typing import Optional
 
@@ -142,6 +143,86 @@ async def draft_reply(
         # looks like an ordinary reply.
         reply = f"{reply} Someone from our team will follow up shortly."
     return (reply, handoff)
+
+
+VALUE_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "score": types.Schema(type=types.Type.INTEGER, description="0-100, how worth chasing this lead looks"),
+        "tier": types.Schema(type=types.Type.STRING, enum=["high", "medium", "low"]),
+        "reasons": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(type=types.Type.STRING),
+            description="2-4 short, concrete, evidence-based reasons - quote or paraphrase what they actually said. Never invent detail that isn't in the conversation.",
+        ),
+    },
+    required=["score", "tier", "reasons"],
+)
+
+VALUE_RULES = """
+Rate how much this Instagram DM conversation looks worth a manufacturing
+business's time to chase, based only on what's actually in the messages.
+
+Weigh things like: order size or repeat-order language ("500 pieces",
+"every month"), whether they sound like a business/reseller rather than a
+one-off buyer, urgency or a clear buying decision already made, and any
+signal of scale (their own follower count or verified badge isn't visible to
+you here - go on conversation content only). A polite "just browsing" or a
+single vague "price?" with no follow-through is low. A detailed spec with a
+quantity is at least medium.
+
+tier "high": clear signal of a large or recurring order, or someone acting
+  on behalf of a business/brand.
+tier "medium": genuine buying intent with some concrete detail, but small or
+  still vague on size.
+tier "low": too early to tell, or signals of a low-value/one-off inquiry.
+
+Every reason must be traceable to something actually said - never assert a
+detail (a quantity, a company name) that isn't in the transcript. If there
+isn't enough conversation yet to judge, say so as one of the reasons and
+lean tier "low" rather than guessing.
+""".strip()
+
+
+async def assess_value(
+    history: list[dict], customer_name: Optional[str], referral: Optional[str] = None
+) -> Optional[dict]:
+    """How much this lead looks worth chasing - {score, tier, reasons}, or
+    None on any failure. A separate call from draft_reply on purpose: a
+    scoring hiccup must never affect the reply the customer actually sees."""
+    system = VALUE_RULES
+    if customer_name:
+        system += f"\n\nThe customer's first name is {customer_name}."
+    if referral:
+        system += f"\n\nHow this conversation started: {referral}."
+
+    try:
+        response = await client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=_to_gemini(history, []),
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=1024,
+                temperature=0.2,
+                response_mime_type="application/json",
+                response_schema=VALUE_SCHEMA,
+                # A classification call, not a reasoning one - without this,
+                # Gemini 2.5's invisible "thinking" tokens eat the entire
+                # output budget before a single character of JSON is written,
+                # and the response comes back truncated (confirmed by testing:
+                # finish_reason MAX_TOKENS with a couple of tokens of output).
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        data = json.loads(response.text)
+        return {
+            "score": int(data["score"]),
+            "tier": data["tier"],
+            "reasons": [str(r) for r in data["reasons"]][:4],
+        }
+    except Exception:
+        log.exception("assess_value failed")
+        return None
 
 
 async def describe_media(data: bytes, mime_type: str) -> Optional[str]:

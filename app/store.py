@@ -9,6 +9,7 @@ isn't local disk. Local SQLite would silently reset several times a day.
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -83,6 +84,7 @@ async def add_message(
     text: str,
     referral: Optional[str] = None,
     reply_to_mid: Optional[str] = None,
+    mid: Optional[str] = None,
 ) -> None:
     try:
         response = await _http.post(
@@ -94,6 +96,7 @@ async def add_message(
                 "content": text,
                 "referral": referral,
                 "reply_to_mid": reply_to_mid,
+                "mid": mid,
             },
         )
         if response.status_code >= 400:
@@ -155,12 +158,41 @@ async def get_referral(convo: str) -> Optional[str]:
     return row.get("referral") if row else None
 
 
+async def set_value(convo: str, score: int, tier: str, reasons: list[str]) -> None:
+    """Record how much this lead looks worth chasing, per app.brain.assess_value.
+    Never used by the reply logic - purely for the dashboard's Leads list."""
+    await _upsert_thread(
+        convo,
+        {
+            "value_score": score,
+            "value_tier": tier,
+            "value_reasons": reasons,
+            "value_updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+async def should_assess_value(convo: str, cooldown_minutes: float) -> bool:
+    """Whether it's been long enough since the last score to justify another
+    Gemini call - keeps scoring cost proportional to real activity instead of
+    running on every single message."""
+    row = await _get_thread(convo)
+    updated_at = row.get("value_updated_at") if row else None
+    if not updated_at:
+        return True
+    try:
+        last = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - last).total_seconds() > cooldown_minutes * 60
+
+
 async def _get_thread(convo: str) -> Optional[dict]:
     try:
         response = await _http.get(
             f"{SUPABASE_URL}/rest/v1/ig_bot_threads",
             headers=_headers,
-            params={"convo": f"eq.{convo}", "select": "muted_until,referral"},
+            params={"convo": f"eq.{convo}", "select": "muted_until,referral,value_updated_at"},
         )
         if response.status_code >= 400:
             log.warning("thread fetch failed (%s): %s", response.status_code, response.text)
