@@ -135,7 +135,13 @@ async def draft_reply(
         return (FALLBACK, True)
 
     handoff = HANDOFF_MARKER in text
-    return (text.replace(HANDOFF_MARKER, "").strip() or FALLBACK, handoff)
+    reply = text.replace(HANDOFF_MARKER, "").strip() or FALLBACK
+    if handoff:
+        # Never trust the model to remember to say this every time - the
+        # customer must always be told, not just silently muted after what
+        # looks like an ordinary reply.
+        reply = f"{reply} Someone from our team will follow up shortly."
+    return (reply, handoff)
 
 
 async def describe_media(data: bytes, mime_type: str) -> Optional[str]:
