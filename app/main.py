@@ -148,9 +148,21 @@ def _extract_referral(event: dict) -> Optional[str]:
 
 async def _handle_echo(platform: str, entry_id: str, event: dict, message: dict) -> None:
     """A message we did not send went out from the Page - a teammate is
-    handling this lead. Go quiet rather than talking over them."""
+    handling this lead. Go quiet rather than talking over them.
+
+    Meta echoes our own outgoing messages back to this same webhook, and
+    that echo can arrive before our own record_sent_mid() write for it has
+    landed - a real race, not a hypothetical one. A single failed check
+    must not be enough to conclude "human sent this"; give our own
+    bookkeeping a moment to catch up before believing it.
+    """
     mid = message.get("mid", "")
-    if not mid or await store.was_sent_by_us(mid):
+    if not mid:
+        return
+    if await store.was_sent_by_us(mid):
+        return
+    await asyncio.sleep(1.5)
+    if await store.was_sent_by_us(mid):
         return
     customer_id = (event.get("recipient") or {}).get("id")
     if not customer_id:
