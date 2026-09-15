@@ -20,6 +20,10 @@ services:
         sync: false
       - key: META_IG_APP_SECRET
         sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
       - key: GOOGLE_API_KEY
         sync: false
       - key: GEMINI_MODEL

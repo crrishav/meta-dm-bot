@@ -15,9 +15,15 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
-from . import dashboard, meta, store, supa
+from . import brain, dashboard, meta, store, supa
 from .brain import assess_value, describe_media, draft_reply
 from .config import DEBOUNCE_SECONDS, HANDOFF_HOURS, VERIFY_TOKEN
+
+# Sent instead of an AI reply when the customer's message is just a photo or
+# voice note with no typed text - we don't show media to the model anymore,
+# so a person needs to look at it themselves.
+MEDIA_HOLDING_REPLY = "Thanks for sending that - one of our team will take a look and reply shortly."
+MEDIA_ATTACHMENT_TYPES = {"image", "audio"}
 
 # How often a thread's lead-value score is allowed to refresh - keeps the
 # Gemini scoring call proportional to real activity, not one per message.
@@ -37,6 +43,10 @@ _locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 # still lets the model see the picture, even though only the second
 # message's task runs.
 _pending_media: dict[str, list[str]] = defaultdict(list)
+# Whether the message that triggered the currently-running debounce task was
+# a bare photo/voice note (no typed text) - checked by the winning task to
+# decide between a real reply and MEDIA_HOLDING_REPLY.
+_media_only: dict[str, bool] = {}
 
 
 @asynccontextmanager
@@ -48,6 +58,7 @@ async def lifespan(_: FastAPI):
     await supa.aclose()
     await store.aclose()
     await dashboard.aclose()
+    await brain.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -234,6 +245,9 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
     pending = _pending_media[convo] + _extract_media_urls(event)
     _pending_media[convo] = pending[-MAX_MEDIA_PER_TURN:]
 
+    attachment_types = {a.get("type") for a in message.get("attachments") or []}
+    _media_only[convo] = bool(attachment_types & MEDIA_ATTACHMENT_TYPES) and not message.get("text")
+
     if await store.is_muted(convo):
         log.info("%s is muted - logged but not replying", convo)
         return
@@ -256,8 +270,13 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
         for data, mime_type in media:
             asyncio.create_task(_archive_media(convo, data, mime_type))
 
-        history = await store.history(convo)
-        reply, handoff = await draft_reply(history, name, media, await store.get_referral(convo))
+        if _media_only.pop(convo, False):
+            # A bare photo/voice note - we no longer show media to the model,
+            # so hand this straight to a person rather than guessing at it.
+            reply, handoff = MEDIA_HOLDING_REPLY, True
+        else:
+            history = await store.history(convo)
+            reply, handoff = await draft_reply(history, name, await store.get_referral(convo))
 
         sent_mid = await meta.send_text(entry_id, sender_id, reply[:1900], platform)
         if sent_mid:

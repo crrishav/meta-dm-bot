@@ -22,6 +22,11 @@ IG_APP_SECRET = _required("META_IG_APP_SECRET")
 VERIFY_TOKEN = _required("META_VERIFY_TOKEN")
 IG_TOKEN = _required("META_IG_TOKEN")
 
+GROQ_API_KEY = _required("GROQ_API_KEY")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
+# Still used for lead-value scoring and archive descriptions - not for
+# replies, which now go through Groq (text only).
 GOOGLE_API_KEY = _required("GOOGLE_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 

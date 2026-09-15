@@ -1,8 +1,9 @@
 # Meta DM auto-reply bot
 
-Reads and replies to Instagram DMs using Google's Gemini - text, photos, and
-voice notes - via the Instagram API with Instagram Login (no linked Facebook
-Page required).
+Replies to Instagram DM text messages using Groq, via the Instagram API with
+Instagram Login (no linked Facebook Page required). A photo or voice note
+with no typed text gets a short holding reply instead - the model is text
+only for now - and the thread is handed to a person.
 
 ## How it works
 
@@ -18,9 +19,10 @@ Customer DMs your Instagram account
                       - wait 2s in case they are still typing
                       - download any photo/voice note, archive it permanently
                         in Supabase Storage (Meta's CDN links expire)
-                      - load recent history from Supabase
-                      - ask Gemini for a reply - it can see the photo and
-                        listen to the voice note directly
+                      - a bare photo/voice note (no typed text) gets a
+                        holding reply and an immediate handoff - no model call
+                      - otherwise load recent history from Supabase and ask
+                        Groq for a text reply
                       - send it back via the Graph API
                       - if it needs a person, mute the thread and alert
 ```
@@ -133,15 +135,16 @@ DM the account from a tester account. You should see the reply.
 | 403 "bad signature" on every POST | You're signing/checking against `META_APP_SECRET` instead of `META_IG_APP_SECRET` - they are different secrets |
 | Voice note attachment fails to download | Instagram serves voice notes as `video/mp4`, not `audio/*` - `download_media` in `app/meta.py` already accounts for this, but if you touch that check, keep it |
 | Token stops working after ~1 hour | You saved a short-lived token. Exchange it, or just regenerate from the API setup page - it's quick |
-| Gemini quota exhausted fast | Some Gemini model IDs (notably the newest ones) get a tiny free-tier daily cap. `gemini-2.5-flash` has a far higher one for the same capability - check `aistudio.google.com` if replies start silently falling back to the generic message |
+| Replies silently fall back to the generic message | Check `GROQ_API_KEY`/`GROQ_MODEL` and Groq's status/rate limits at `console.groq.com` - `draft_reply` in `app/brain.py` falls back and hands off on any Groq error |
+| Gemini quota exhausted fast | Only affects lead-value scoring and archive descriptions now, not replies. Some Gemini model IDs (notably the newest ones) get a tiny free-tier daily cap - `gemini-2.5-flash` has a far higher one for the same capability, check `aistudio.google.com` |
 | Replies stop after a day | The 24-hour messaging window closed - you may only reply within 24h of the customer's last message (or use a `messaging_referral`-tagged first contact) |
 
 ## Cost
 
-Each reply is roughly 1-2k input tokens and well under 100 output.
-`gemini-2.5-flash`'s free tier is generous enough for real early usage;
-check current rate limits at aistudio.google.com since volume can outrun
-them. Set `GEMINI_MODEL` in `.env` to switch models.
+Each reply is roughly 1-2k input tokens and well under 400 output, via Groq
+(`GROQ_MODEL` in `.env`, default `openai/gpt-oss-120b`). Lead-value
+scoring and archive descriptions still run on Gemini's free tier - check
+current rate limits at aistudio.google.com since volume can outrun them.
 
 ## Where to take it next
 
