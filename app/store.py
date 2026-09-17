@@ -74,8 +74,11 @@ async def was_sent_by_us(mid: str) -> bool:
         )
         return response.status_code == 200 and len(response.json()) > 0
     except httpx.HTTPError as exc:
-        log.warning("was_sent_by_us error: %s", exc)
-        return False
+        # "Couldn't check" is not "a human sent it". The only caller mutes the
+        # bot for hours on a False, so a Supabase blip would otherwise silence
+        # every conversation the bot replies to while it lasts.
+        log.warning("was_sent_by_us error (%s) - assuming our own echo", exc)
+        return True
 
 
 async def add_message(

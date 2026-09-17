@@ -98,12 +98,14 @@ def _to_gemini(history: list[dict]) -> list[types.Content]:
 
 def _to_groq(history: list[dict], system: str) -> list[dict]:
     """Our store already speaks 'user'/'assistant', same as Groq's OpenAI-
-    compatible chat format - just prepend the system prompt."""
+    compatible chat format - just prepend the system prompt.
+
+    Deliberately no trimming of a trailing assistant turn here. Dropping one
+    hides a reply we already sent from the model, which then answers the
+    message before it a second time - the caller checks for that case and
+    declines to draft at all instead.
+    """
     messages = [{"role": "user" if turn["role"] != "assistant" else "assistant", "content": turn["content"]} for turn in history]
-    # Same defensive trim as _to_gemini - a stray leading/trailing assistant
-    # turn from an overlapping webhook delivery should never reach the API.
-    while messages and messages[-1]["role"] == "assistant":
-        messages.pop()
     return [{"role": "system", "content": system}, *messages]
 
 

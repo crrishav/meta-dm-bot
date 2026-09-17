@@ -49,6 +49,13 @@ _pending_media: dict[str, list[str]] = defaultdict(list)
 _media_only: dict[str, bool] = {}
 
 
+def _superseded(convo: str, my_turn: int) -> bool:
+    """Whether a newer customer message has arrived since this task claimed
+    its turn. If one has, that message's own task is the one that answers -
+    it sees this task's message in its history and replies to both together."""
+    return _arrival_counter[convo] != my_turn
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     store.init()
@@ -257,10 +264,16 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
 
     # Give them a moment to finish typing the rest of their thought.
     await asyncio.sleep(DEBOUNCE_SECONDS)
-    if _arrival_counter[convo] != my_turn:
-        return  # a newer message arrived; that task will answer
+    if _superseded(convo, my_turn):
+        return
 
     async with _locks[convo]:
+        # Waiting for the lock means another task was mid-reply, which takes
+        # as long as a model call - plenty of time for a newer message to have
+        # arrived and made this turn stale.
+        if _superseded(convo, my_turn):
+            return
+
         await meta.send_typing(entry_id, sender_id)
         name = await meta.profile_name(entry_id, sender_id)
 
@@ -276,7 +289,22 @@ async def _handle(platform: str, entry_id: str, event: dict) -> None:
             reply, handoff = MEDIA_HOLDING_REPLY, True
         else:
             history = await store.history(convo)
+            # Only draft when the customer genuinely has the last word. An
+            # assistant turn last means this message was already answered -
+            # by an overlapping task, or by a human in the app whose echo
+            # landed during the debounce - and an empty list means the fetch
+            # failed, which would have us reply from the brief alone, with
+            # none of this conversation in front of us.
+            if not history or history[-1]["role"] != "user":
+                log.info("%s: no unanswered customer message in history - not replying", convo)
+                return
             reply, handoff = await draft_reply(history, name, await store.get_referral(convo))
+
+        # The draft only answers what existed when it was written. If more has
+        # arrived since, sending it would answer half a thought and leave the
+        # newer task to answer the rest - two replies to one message.
+        if _superseded(convo, my_turn):
+            return
 
         sent_mid = await meta.send_text(entry_id, sender_id, reply[:1900], platform)
         if sent_mid:
